@@ -1,0 +1,12 @@
+py -m pip install opencv-python
+
+stabilize image
+grayscale
+blur
+time differentials
+some metric (multiple?) for amount of recent change
+based on amount of change and time?
+thresholding
+
+expect distant objects to have both smaller differences and with fewer pixels
+affected, so perhaps use low-pass filter to adjust sensitivity for distance.
