@@ -29,52 +29,74 @@ class Playlist:
         return cls(Path(base).rglob(pattern))
 
 
-def differences(source: VideoCapture, first_frame=None):
-    if first_frame is None:
-        status, first_frame = source.read()
-
-    prior_frame = first_frame
-
-    while source.isOpened():
-        status, next_frame = source.read()
-        if not status:
-            break
-
-        frame_time = source.get(cv2.CAP_PROP_POS_MSEC)
-        diff = cv2.absdiff(prior_frame, next_frame)
-        yield frame_time, diff
-
-        prior_frame = next_frame
-
-
-def present_diffs(source: VideoCapture):
-    for t, frame in differences(source):
-        show_frame(frame, 0)
-
-
 def show_frame(frame, wait=1, title="Frame"):
     cv2.imshow(title if title else "Frame", frame)
     return cv2.waitKey(wait if wait is not None else 1)
+
+
+def yield_vc_frames(vc: VideoCapture, ms: Optional[int] = None) -> Iterator[Frame]:
+    if ms is not None:
+        vc.set(cv2.CAP_PROP_POS_MSEC, ms)
+
+    while True:
+        status, frame = vc.read()
+        if status:
+            yield frame
+        else:
+            return
+
+
+def yield_frames(source: FrameSource, start: Optional[int] = None) -> Iterator[Frame]:
+    if isinstance(source, (str | Path)):
+        source = cv2.VideoCapture(source)
+
+    if isinstance(source, VideoCapture):
+        return yield_vc_frames(source, start)
+    else:
+        return iter(source)
+
+
+def yield_gray_frames(source: FrameSource, conversion=cv2.COLOR_BGR2GRAY):
+    for frame in yield_frames(source):
+        yield cv2.cvtColor(frame, conversion)
+
+
+def yield_deltas(source: FrameSource, first_frame=None):
+    frames = yield_frames(source)
+    prior_frame = next(frames) if first_frame is None else first_frame
+
+    for next_frame in frames:
+        diff = cv2.absdiff(prior_frame, next_frame)
+        yield diff
+        prior_frame = next_frame
+
+
+def present_diffs(source: FrameSource):
+    for frame in yield_deltas(source):
+        show_frame(frame, 0)
 
 
 def blend(a, b, alpha: float):
     return cv2.addWeighted(a, alpha, b, 1 - alpha, 0)
 
 
-# recommend alpha = .97 for pathways? .8 to .85 for tracking?
-def yield_blends(source: VideoCapture, alpha: float):
-    iterator = differences(source)
-    t, prior = next(iterator)
+def mask_frame(mask, frame):
+    return cv2.bitwise_and(frame, frame, mask=mask)
 
-    for t, frame in iterator:
+
+# recommend alpha = .97 for pathways? .8 to .85 for tracking?
+def yield_blends(source: FrameSource, alpha: float):
+    iterator = yield_deltas(source)
+    prior = next(iterator)
+
+    for frame in iterator:
         blended = blend(prior, frame, alpha)
-        yield t, blended
+        yield blended
         prior = blended
 
 
-def present_blends(source: VideoCapture, alpha: float):
-    for t, blended in yield_blends(source, alpha):
-        print(t)
+def present_blends(source: FrameSource, alpha: float):
+    for blended in yield_blends(source, alpha):
         show_frame(blended, 0)
 
 
@@ -82,13 +104,10 @@ def present_blends(source: VideoCapture, alpha: float):
 # that to shape the detection blur along lane and reduce adjacent lane influence?
 
 
-def present_blurred_blends(
-    source: VideoCapture, alpha: float = 0.8, blursize: int = 51
-):
+def present_blurred_blends(source: FrameSource, alpha: float = 0.8, blursize: int = 51):
     # TODO: Give better error message indicating blursize must be odd?
     # Or have argument be radius, then double + 1?
-    for t, blended in yield_blends(source, alpha):
-        print(t)
+    for blended in yield_blends(source, alpha):
         blurred = cv2.GaussianBlur(blended, (blursize, blursize), 0)
         show_frame(blurred, 0)
 
@@ -107,39 +126,6 @@ def delta_blur(frame, blursize1=20, blursize2=80):
     blurred1 = cv2.GaussianBlur(frame, (diameter1, diameter1), 0)
     blurred2 = cv2.GaussianBlur(frame, (diameter2, diameter2), 0)
     return blurred2 - blurred1
-
-
-def mask_frame(mask, frame):
-    return cv2.bitwise_and(frame, frame, mask=mask)
-
-
-def frames_from_vc(
-    source: VideoCapture, start: Optional[int] = None
-) -> Iterator[Frame]:
-    if start is not None:
-        source.set(cv2.CAP_PROP_POS_MSEC, start)
-
-    while True:
-        status, frame = source.read()
-        if status:
-            yield frame
-        else:
-            return
-
-
-def yield_frames(source: FrameSource, start: Optional[int] = None) -> Iterator[Frame]:
-    if isinstance(source, (str | Path)):
-        source = cv2.VideoCapture(source)
-
-    if isinstance(source, VideoCapture):
-        return frames_from_vc(source, start)
-    else:
-        return source
-
-
-def yield_gray_frames(source: FrameSource, conversion=cv2.COLOR_BGR2GRAY):
-    for frame in yield_frames(source):
-        yield cv2.cvtColor(frame, conversion)
 
 
 def present_masked_frames(
@@ -239,11 +225,10 @@ def present_foregrounds(source: FrameSource):
     frames = iter(yield_frames(source))
     first_frame = next(frames)
     bg_gen = background_accumulator(first_frame)
-    _ = next(
-        bg_gen
-    )  # otherwise we get an error sending a value to a just-started generator
+    # Avoid the error from sending a value to a just-started generator.
+    next(bg_gen)
     foreground = first_frame
-    show_frame(foreground)
+    # show_frame(foreground)
 
     for frame in frames:
         bg = bg_gen.send(frame)
