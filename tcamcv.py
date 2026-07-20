@@ -4,7 +4,7 @@ import cv2
 from cv2 import VideoCapture
 import numpy as np
 from pathlib import Path
-from typing import Iterable, Iterator, Optional
+from typing import Callable, Iterable, Iterator, Optional
 
 # A video frame.
 Frame = np.ndarray
@@ -22,7 +22,7 @@ class Playlist:
     def __iter__(self):
         for file in self.files:
             vc = cv2.VideoCapture(file)
-            yield from yield_frames(vc)
+            yield from iterframes(vc)
 
     @classmethod
     def rglob(cls, base: Path | str, pattern: str = "*"):
@@ -34,7 +34,7 @@ def show_frame(frame, wait=1, title="Frame"):
     return cv2.waitKey(wait if wait is not None else 1)
 
 
-def yield_vc_frames(vc: VideoCapture, ms: Optional[int] = None) -> Iterator[Frame]:
+def itervc(vc: VideoCapture, ms: Optional[int] = None) -> Iterator[Frame]:
     if ms is not None:
         vc.set(cv2.CAP_PROP_POS_MSEC, ms)
 
@@ -46,34 +46,84 @@ def yield_vc_frames(vc: VideoCapture, ms: Optional[int] = None) -> Iterator[Fram
             return
 
 
-def yield_frames(source: FrameSource, start: Optional[int] = None) -> Iterator[Frame]:
+def iterframes(source: FrameSource, start: Optional[int] = None) -> Iterator[Frame]:
     if isinstance(source, (str | Path)):
+        # FIXME: Handle bad path appropriately.
         source = cv2.VideoCapture(source)
 
     if isinstance(source, VideoCapture):
-        return yield_vc_frames(source, start)
+        return itervc(source, start)
     else:
         return iter(source)
 
 
-def yield_gray_frames(source: FrameSource, conversion=cv2.COLOR_BGR2GRAY):
-    for frame in yield_frames(source):
+def iter_gray_frames(source: FrameSource, conversion=cv2.COLOR_BGR2GRAY):
+    for frame in iterframes(source):
         yield cv2.cvtColor(frame, conversion)
 
 
-def yield_deltas(source: FrameSource, first_frame=None):
-    frames = yield_frames(source)
-    prior_frame = next(frames) if first_frame is None else first_frame
+class Differencer:
+    def __init__(self, prior_frame: Optional[Frame] = None):
+        self._prior_frame = prior_frame
 
-    for next_frame in frames:
-        diff = cv2.absdiff(prior_frame, next_frame)
-        yield diff
-        prior_frame = next_frame
+    def feed(self, frame: Frame) -> Frame | None:
+        """Send priming or running inputs."""
+        if self._prior_frame is None:
+            self._prior_frame = frame
+            return None
+        else:
+            return self.next(frame)
+
+    def prime(self, frame: Frame):
+        if self._prior_frame is None:
+            self._prior_frame = frame
+        else:
+            raise RuntimeError("Differencer has already been primed")
+
+    def prime_from(self, source: Iterator[Frame]):
+        """Consume items from the source until primed."""
+        consumed = 0
+        while not self.primed():
+            self.prime(next(source))
+            consumed += 1
+        return consumed
+
+    def next(self, frame: Frame):
+        """Send running inputs (after priming) and get resulting outputs."""
+        assert self._prior_frame is not None
+        diff = cv2.absdiff(frame, self._prior_frame)
+        self._prior_frame = frame
+        return diff
+
+    def primed(self):
+        return self._prior_frame is not None
 
 
-def present_diffs(source: FrameSource):
-    for frame in yield_deltas(source):
-        show_frame(frame, 0)
+def iter_deltas(source: FrameSource, first_frame: Optional[Frame] = None):
+    frames = iterframes(source)
+    differ = Differencer(first_frame)
+    differ.prime_from(frames)
+
+    for frame in frames:
+        yield differ.next(frame)
+
+
+def present_with(
+    source: FrameSource,
+    func: Callable[[FrameSource], Iterator[Frame]],
+    wait: Optional[int] = None,
+):
+    wait = 1 if wait is None else wait
+    for frame in func(source):
+        show_frame(frame, wait)
+
+
+def present_frames(source: FrameSource, wait: Optional[int] = None):
+    present_with(source, iterframes, wait)
+
+
+def present_diffs(source: FrameSource, wait: Optional[int] = None):
+    present_with(source, iter_deltas, wait)
 
 
 def blend(a, b, alpha: float):
@@ -86,7 +136,7 @@ def mask_frame(mask, frame):
 
 # recommend alpha = .97 for pathways? .8 to .85 for tracking?
 def yield_blends(source: FrameSource, alpha: float):
-    iterator = yield_deltas(source)
+    iterator = iter_deltas(source)
     prior = next(iterator)
 
     for frame in iterator:
@@ -136,7 +186,7 @@ def present_masked_frames(
     beta: float = 0.8,
     threshold: float = 160,
 ):
-    iterator = yield_gray_frames(source)
+    iterator = iter_gray_frames(source)
     first_frame = next(iterator)
     second_frame = next(iterator)
     first_diff = cv2.absdiff(first_frame, second_frame)
@@ -193,7 +243,7 @@ def present_masked_frames(
 
 
 def get_background(source: FrameSource, alpha: float = 0.01):
-    frames = iter(yield_frames(source))
+    frames = iter(iterframes(source))
 
     # need to change type to avoid an assertion error
     accumulator = next(frames).astype(np.float32)
@@ -222,7 +272,7 @@ def constant_accumulator(frame: Frame):
 
 
 def present_foregrounds(source: FrameSource):
-    frames = iter(yield_frames(source))
+    frames = iter(iterframes(source))
     first_frame = next(frames)
     bg_gen = background_accumulator(first_frame)
     # Avoid the error from sending a value to a just-started generator.
