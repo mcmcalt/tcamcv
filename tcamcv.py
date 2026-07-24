@@ -224,7 +224,7 @@ class MaskGenerator:
     def __init__(
         self,
         first_frame: Frame,
-        alpha: float = 0.8,
+        alpha: float = 0.8,  # .1 to .12 produce an interesting snowplow-like effect
         innerblur: int = 15,
         outerblur: int = 20,
         fine_coeff: float = 6,
@@ -359,7 +359,9 @@ class Overlayer:
         frame_to_mask = self.history.get(None, True)
         assert frame_to_mask is not None
         # TODO: Use cv2.bitwise_and if the mask is binary
-        overlaid = frame_to_mask.astype(np.float16) * (overlay if len(frame_to_mask.shape) == 2 else overlay[:, :, np.newaxis])
+        overlaid = frame_to_mask.astype(np.float16) * (
+            overlay if len(frame_to_mask.shape) == 2 else overlay[:, :, np.newaxis]
+        )
         return overlaid.astype(np.uint8)
 
     def threshold(self, frame: Frame, mask_threshold: int = 128):
@@ -451,3 +453,22 @@ def present_foregrounds(source: FrameSource):
         bg = bg_gen.send(frame)
         foreground = cv2.absdiff(frame, bg)
         show_frame(foreground)
+
+
+def average_pixel_values(source: FrameSource):
+    # NOTE: Assumes np.uint8 elements
+    frames = iterframes(source)
+    running_total = next(frames).astype(np.uint32)
+    count = 1
+    for frame in frames:
+        running_total += frame
+        count += 1
+
+    return (running_total / count).astype(np.uint8)
+
+
+def average_mask(source: FrameSource, *args, **kwargs) -> Frame:
+    frames = iter_gray_frames(source)
+    first_frame = next(frames)
+    mask_generator = MaskGenerator(first_frame, *args, **kwargs)
+    return average_pixel_values(mask_generator.next(frame) for frame in frames)
