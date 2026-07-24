@@ -1,5 +1,8 @@
 """Traffic camera computer vision experimentation"""
 
+from collections import deque
+from itertools import islice
+
 import cv2
 from cv2 import VideoCapture
 import numpy as np
@@ -62,6 +65,10 @@ def iter_gray_frames(source: FrameSource, conversion=cv2.COLOR_BGR2GRAY):
         yield cv2.cvtColor(frame, conversion)
 
 
+itergrays = iter_gray_frames
+grays = iter_gray_frames
+
+
 class Differencer:
     def __init__(self, prior_frame: Optional[Frame] = None):
         self._prior_frame = prior_frame
@@ -112,9 +119,10 @@ def present_with(
     source: FrameSource,
     func: Callable[[FrameSource], Iterator[Frame]],
     wait: Optional[int] = None,
+    **kwargs
 ):
     wait = 1 if wait is None else wait
-    for frame in func(source):
+    for frame in func(source, **kwargs):
         show_frame(frame, wait)
 
 
@@ -146,25 +154,37 @@ def yield_blends(source: FrameSource, alpha: float):
 
 
 def present_blends(source: FrameSource, alpha: float):
-    for blended in yield_blends(source, alpha):
-        show_frame(blended, 0)
+    present_with(source, yield_blends, alpha=alpha)
+
+
+def blur(frame: Frame, radius: int = 20):
+    diameter = radius * 2 + 1
+    return cv2.GaussianBlur(frame, (diameter, diameter), 0)
 
 
 # TODO: Use high-persistence frame blend to get pathways, then use
 # that to shape the detection blur along lane and reduce adjacent lane influence?
 
 
-def present_blurred_blends(source: FrameSource, alpha: float = 0.8, blursize: int = 51):
-    # TODO: Give better error message indicating blursize must be odd?
-    # Or have argument be radius, then double + 1?
-    for blended in yield_blends(source, alpha):
-        blurred = cv2.GaussianBlur(blended, (blursize, blursize), 0)
-        show_frame(blurred, 0)
+def iter_blurred_blends(source: FrameSource, alpha: float = 0.8, blursize: int = 20):
+    diameter = blursize * 2 + 1
+    for blend in yield_blends(source, alpha):
+        yield cv2.GaussianBlur(blend, (diameter, diameter), 0)
+
+
+def present_blurred_blends(source: FrameSource, alpha: float = 0.8, blursize: int = 20):
+    present_with(
+        source,
+        iter_blurred_blends,
+        alpha=alpha,
+        blursize=blursize,
+    )
 
 
 def blur_peaks(frame, blursize=2):
     diameter = blursize * 2 + 1
     blurred = cv2.GaussianBlur(frame, (diameter, diameter), 0)
+    # TODO: Fix range underflow.
     return frame - blurred
 
 
@@ -175,21 +195,56 @@ def delta_blur(frame, blursize1=20, blursize2=80):
     diameter2 = blursize2 * 2 + 1
     blurred1 = cv2.GaussianBlur(frame, (diameter1, diameter1), 0)
     blurred2 = cv2.GaussianBlur(frame, (diameter2, diameter2), 0)
-    return blurred2 - blurred1
+    # Would it be better to rescale either blur's output range separately first?
+    return blurred1.astype(np.int16) - blurred2.astype(np.int16)
+
+
+class FrameHistory:
+    def __init__(self, length: int, source: FrameSource | None = None):
+        self.history = deque[Frame](
+            # The deque constructor would iterate the whole input and only
+            # save the end.
+            [] if source is None else islice(iterframes(source), length),
+            length,
+        )
+
+    def save(self, frame: Frame):
+        self.history.append(frame)
+
+    def get(self, age: int | None = None, fill: bool = True):
+        try:
+            return self.history[0 if age is None else -age - 1]
+        except IndexError as err:
+            if fill:
+                # might not have any frames though.
+                return self.history[0]
 
 
 def present_masked_frames(
     source: FrameSource,
     alpha: float = 0.8,
     innerblur: int = 20,
-    outerblur: int = 80,
+    outerblur: int = 25,
+    fine_coeff: float = 4,
+    coarse_coeff: float = 2,
+    bias: int = 64,
     beta: float = 0.8,
-    threshold: float = 160,
+    threshold: float = 80,
+    mask_blend_factor=0.5,
+    mask_blur_radius=5,
+    mask_threshold=128,
+    delay=6,
 ):
+    # Lots of trial and error here, there are likely redundant
+    # and inefficient parts.
+
     iterator = iter_gray_frames(source)
+
     first_frame = next(iterator)
     second_frame = next(iterator)
-    first_diff = cv2.absdiff(first_frame, second_frame)
+
+    differ = Differencer(first_frame)
+    first_diff = differ.next(second_frame)
 
     prior_frame = second_frame
     prior_diff = first_diff
@@ -197,15 +252,46 @@ def present_masked_frames(
 
     blended_blur = None
 
-    # FIXME: Keep delayed version of frames if needed to align with mask
+    # Keep delayed version of frames if needed to align with mask.
+    # TODO: convert to gray after iteration so history can get the colored frame.
+    history = FrameHistory(delay)
+    history.save(first_frame)
+    history.save(second_frame)
+
+    blended_mask = None
+
+    def get_fine_blur(frame: Frame):
+        return blur(frame, innerblur)
+
+    def get_coarse_blur(frame: Frame):
+        return blur(frame, outerblur)
 
     for this_frame in iterator:
-        this_diff = cv2.absdiff(this_frame, prior_frame)
+        history.save(this_frame)
+
+        this_diff = differ.next(this_frame)
         # TODO: Use generators that can be sent the shared frame and return
         # their respective next output.
         this_blend = blend(this_diff, prior_blend, alpha)
-        this_blur_delta = delta_blur(this_blend, innerblur, outerblur)
+        # this_blur_delta = delta_blur(this_blend, innerblur, outerblur)
+
+        fine_blur = get_fine_blur(this_blend)
+        # Would it be more efficient to apply additional blur to fine_blur?
+        coarse_blur = get_coarse_blur(this_blend)
+
+        this_blur_delta = cv2.addWeighted(
+            fine_blur, fine_coeff, coarse_blur, coarse_coeff, bias
+        )
+
         # show_frame(this_blur_delta)
+
+        # print(this_blur_delta)
+        # biased = this_blur_delta + 128
+        # clamped = np.clip(biased, 0, 255)
+        # unsigned = clamped.astype(np.uint8)
+        # show_frame(unsigned)
+        # show_frame(np.where(this_blur_delta < 0, 128, this_blur_delta))
+        # this_blur_delta = this_blur_delta.astype(np.uint8)
 
         if blended_blur is None:
             blended_blur = this_blur_delta
@@ -225,16 +311,32 @@ def present_masked_frames(
 
         # Create mask with full-scale values where the image should have a mask
         # (blocked out or diminished).
-        _, mask = cv2.threshold(blended_blur, threshold, 255, cv2.THRESH_BINARY_INV)
+        # Maybe apply a sigmoid function instead of a binary threshold?
+        _, mask = cv2.threshold(
+            blended_blur, threshold, 255, cv2.THRESH_BINARY
+        )  # cv2.THRESH_BINARY_INV)
+
+        if blended_mask is None:
+            blended_mask = mask
+        else:
+            blended_mask = blend(mask, blended_mask, mask_blend_factor)
+
+        blurred_mask = blur(blended_mask, mask_blur_radius)
+        # show_frame(blurred_mask)
+
+        mask = blurred_mask
 
         overlay = np.zeros_like(mask)
-        overlay[mask == 255] = 255
+        overlay[mask < mask_threshold] = 255
 
         # mask = cv2.cvtColor(this_blur_delta, cv2.COLOR_BGR2GRAY)
         # masked = mask_frame(mask, prior_frame)
         # show_frame(masked)
 
-        overlaid = cv2.addWeighted(prior_frame, 1, overlay, 0.5, 0)
+        # FIXME: delay isn't working?
+        frame_to_mask = history.get(delay - 1, True)
+        assert frame_to_mask is not None
+        overlaid = cv2.addWeighted(frame_to_mask, 1, overlay, 0.5, 0)
         show_frame(overlaid)
 
         prior_frame = this_frame
