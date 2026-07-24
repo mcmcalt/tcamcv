@@ -220,67 +220,67 @@ class FrameHistory:
                 return self.history[0]
 
 
-def present_masked_frames(
-    source: FrameSource,
-    alpha: float = 0.8,
-    innerblur: int = 15,
-    outerblur: int = 20,
-    fine_coeff: float = 6,
-    coarse_coeff: float = -2,
-    bias: int = 64,
-    beta: float = 0.8,
-    threshold: float = 80,
-    mask_blend_factor=0.5,
-    mask_blur_radius=5,
-    mask_threshold=128,
-    delay=6,
-):
-    # Lots of trial and error here, there are likely redundant
-    # and inefficient parts.
+class MaskGenerator:
+    def __init__(
+        self,
+        first_frame: Frame,
+        alpha: float = 0.8,
+        innerblur: int = 15,
+        outerblur: int = 20,
+        fine_coeff: float = 6,
+        coarse_coeff: float = -2,
+        bias: int = 64,
+        beta: float = 0.8,
+        threshold: float = 80,
+        mask_blend_factor=0.5,
+        mask_blur_radius=5,
+    ):
+        # Lots of trial and error here, there are likely redundant
+        # and inefficient parts.
 
-    iterator = iter_gray_frames(source)
+        self.alpha = alpha
+        self.innerblur = innerblur
+        self.outerblur = outerblur
+        self.fine_coeff = fine_coeff
+        self.coarse_coeff = coarse_coeff
+        self.bias = bias
+        self.beta = beta
+        self.threshold = threshold
+        self.mask_blend_factor = mask_blend_factor
+        self.mask_blur_radius = mask_blur_radius
 
-    first_frame = next(iterator)
-    second_frame = next(iterator)
+        self.differ = Differencer(first_frame)
 
-    differ = Differencer(first_frame)
-    first_diff = differ.next(second_frame)
+        self.prior_blend = None
 
-    prior_frame = second_frame
-    prior_diff = first_diff
-    prior_blend = first_diff
+        self.blended_blur = None
+        self.blended_mask = None
 
-    blended_blur = None
+    def _get_fine_blur(self, frame: Frame):
+        return blur(frame, self.innerblur)
 
-    # Keep delayed version of frames if needed to align with mask.
-    # TODO: convert to gray after iteration so history can get the colored frame.
-    history = FrameHistory(delay)
-    history.save(first_frame)
-    history.save(second_frame)
+    def _get_coarse_blur(self, frame: Frame):
+        return blur(frame, self.outerblur)
 
-    blended_mask = None
+    def next(self, frame: Frame) -> Frame:
+        this_diff = self.differ.next(frame)
 
-    def get_fine_blur(frame: Frame):
-        return blur(frame, innerblur)
-
-    def get_coarse_blur(frame: Frame):
-        return blur(frame, outerblur)
-
-    for this_frame in iterator:
-        history.save(this_frame)
-
-        this_diff = differ.next(this_frame)
         # TODO: Use generators that can be sent the shared frame and return
         # their respective next output.
-        this_blend = blend(this_diff, prior_blend, alpha)
-        # this_blur_delta = delta_blur(this_blend, innerblur, outerblur)
 
-        fine_blur = get_fine_blur(this_blend)
+        if self.prior_blend is None:
+            this_blend = this_diff
+        else:
+            this_blend = blend(this_diff, self.prior_blend, self.alpha)
+
+        self.prior_blend = this_blend
+
+        fine_blur = self._get_fine_blur(this_blend)
         # Would it be more efficient to apply additional blur to fine_blur?
-        coarse_blur = get_coarse_blur(this_blend)
+        coarse_blur = self._get_coarse_blur(this_blend)
 
         this_blur_delta = cv2.addWeighted(
-            fine_blur, fine_coeff, coarse_blur, coarse_coeff, bias
+            fine_blur, self.fine_coeff, coarse_blur, self.coarse_coeff, self.bias
         )
 
         # show_frame(this_blur_delta)
@@ -293,55 +293,120 @@ def present_masked_frames(
         # show_frame(np.where(this_blur_delta < 0, 128, this_blur_delta))
         # this_blur_delta = this_blur_delta.astype(np.uint8)
 
+        blended_blur = self.blended_blur
+
         if blended_blur is None:
             blended_blur = this_blur_delta
         else:
-            blended_blur = blend(blended_blur, this_blur_delta, beta)
+            blended_blur = blend(blended_blur, this_blur_delta, self.beta)
 
-        # FIXME: Need to clamp properly to positive values. Otherwise
-        # negative values will still act as transparent areas.
-        # mask = np.clip(this_blur_delta, 0, 255)
-        # mask = np.clip(blended_blur, 0, 255)
-
-        # print(this_blur_delta)
-        # show_frame(this_blur_delta)
-        # show_frame(blended_blur)
-
-        # mask = blended_blur > 0
+        self.blended_blur = blended_blur
 
         # Create mask with full-scale values where the image should have a mask
         # (blocked out or diminished).
         # Maybe apply a sigmoid function instead of a binary threshold?
         _, mask = cv2.threshold(
-            blended_blur, threshold, 255, cv2.THRESH_BINARY
+            blended_blur, self.threshold, 255, cv2.THRESH_BINARY
         )  # cv2.THRESH_BINARY_INV)
+
+        blended_mask = self.blended_mask
 
         if blended_mask is None:
             blended_mask = mask
         else:
-            blended_mask = blend(mask, blended_mask, mask_blend_factor)
+            blended_mask = blend(mask, blended_mask, self.mask_blend_factor)
 
-        blurred_mask = blur(blended_mask, mask_blur_radius)
+        self.blended_mask = blended_mask
+
+        blurred_mask = blur(blended_mask, self.mask_blur_radius)
         # show_frame(blurred_mask)
 
         mask = blurred_mask
-
-        overlay = np.zeros_like(mask)
-        overlay[mask < mask_threshold] = 255
 
         # mask = cv2.cvtColor(this_blur_delta, cv2.COLOR_BGR2GRAY)
         # masked = mask_frame(mask, prior_frame)
         # show_frame(masked)
 
-        # FIXME: delay isn't working?
-        frame_to_mask = history.get(delay - 1, True)
+        return mask
+
+
+class Overlayer:
+    def __init__(
+        self,
+        first_frame: Frame,
+        mask_func: Callable[[Frame], Frame],
+        delay: int | None = None,
+    ):
+        if delay is None:
+            delay = 6
+
+        self.mask_func = mask_func
+
+        # Keep delayed version of frames if needed to align with mask.
+        # TODO: convert to gray after iteration so history can get the colored frame.
+        history = FrameHistory(delay)
+        self.history = history
+        history.save(first_frame)
+
+    def next(self, frame: Frame):
+        self.history.save(frame)
+        mask = self.mask_func(frame)
+
+        # Reduce values outside focus areas by 1/2, with areas at full scale
+        # in the mask staying unchanged.
+        overlay = 0.5 + mask.astype(np.float16) * (0.5 / 255)
+
+        frame_to_mask = self.history.get(None, True)
+        assert frame_to_mask is not None
+        # TODO: Use cv2.bitwise_and if the mask is binary
+        overlaid = frame_to_mask.astype(np.float16) * (overlay if len(frame_to_mask.shape) == 2 else overlay[:, :, np.newaxis])
+        return overlaid.astype(np.uint8)
+
+    def threshold(self, frame: Frame, mask_threshold: int = 128):
+        self.history.save(frame)
+        mask = self.mask_func(frame)
+
+        overlay = np.zeros_like(mask)
+        overlay[mask < mask_threshold] = 255
+
+        frame_to_mask = self.history.get(None, True)
         assert frame_to_mask is not None
         overlaid = cv2.addWeighted(frame_to_mask, 1, overlay, 0.5, 0)
-        show_frame(overlaid)
 
-        prior_frame = this_frame
-        prior_diff = this_diff
-        prior_blend = this_blend
+        self.prior_frame = frame
+        return overlaid
+
+
+def present_masked_frames(
+    source: FrameSource,
+    delay: int | None = None,
+    conversion=cv2.COLOR_BGR2GRAY,
+    *args,
+    **kwargs
+):
+    frames = iterframes(source)
+    first_frame = next(frames)
+
+    mask_generator = MaskGenerator(
+        (
+            first_frame
+            if conversion is None
+            else cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
+        ),
+        *args,
+        **kwargs
+    )
+
+    def mask_func(frame: Frame):
+        return mask_generator.next(
+            frame if conversion is None else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        )
+
+    overlayer = Overlayer(first_frame, mask_func, delay)
+
+    for frame in frames:
+        overlaid = overlayer.next(frame)
+        show_frame(overlaid)
 
 
 def get_background(source: FrameSource, alpha: float = 0.01):
