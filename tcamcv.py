@@ -142,8 +142,9 @@ def blend(a, b, alpha: float):
     return cv2.addWeighted(a, alpha, b, 1 - alpha, 0)
 
 
-def blend2(b: Frame, a: Frame, alpha: float):
-    return blend(a, b, alpha)
+def blend2(old: Frame, new: Frame, decay: float):
+    # High decay = low influence from old value = low weight.
+    return cv2.addWeighted(old, 1 - decay, new, decay, 0)
 
 
 def mask_frame(mask, frame):
@@ -280,7 +281,7 @@ class MaskGenerator:
         fine_coeff: float = 6,
         coarse_coeff: float = -2,
         bias: int = 64,
-        beta: float = 0.8,
+        beta: float = 0.2,
         threshold: float = 80,
         mask_blend_factor=0.5,
         mask_blur_radius=5,
@@ -301,9 +302,9 @@ class MaskGenerator:
 
         self.differ = Differencer(first_frame)
 
-        self.diff_blender = BlankItegrator[Frame](blend, alpha)
-        self.blur_blender = BlankItegrator[Frame](blend, beta)
-        self.mask_blender = BlankItegrator[Frame](blend, mask_blend_factor)
+        self.diff_blender = BlankItegrator[Frame](blend2, alpha)
+        self.blur_blender = BlankItegrator[Frame](blend2, beta)
+        self.mask_blender = BlankItegrator[Frame](blend2, mask_blend_factor)
 
     def _get_fine_blur(self, frame: Frame):
         return blur(frame, self.innerblur)
@@ -323,16 +324,6 @@ class MaskGenerator:
             fine_blur, self.fine_coeff, coarse_blur, self.coarse_coeff, self.bias
         )
 
-        # show_frame(this_blur_delta)
-
-        # print(this_blur_delta)
-        # biased = this_blur_delta + 128
-        # clamped = np.clip(biased, 0, 255)
-        # unsigned = clamped.astype(np.uint8)
-        # show_frame(unsigned)
-        # show_frame(np.where(this_blur_delta < 0, 128, this_blur_delta))
-        # this_blur_delta = this_blur_delta.astype(np.uint8)
-
         blended_blur = self.blur_blender.next(this_blur_delta)
 
         # Create mask with full-scale values where the image should have a mask
@@ -344,15 +335,8 @@ class MaskGenerator:
 
         blended_mask = self.mask_blender.next(mask)
         blurred_mask = blur(blended_mask, self.mask_blur_radius)
-        # show_frame(blurred_mask)
 
-        mask = blurred_mask
-
-        # mask = cv2.cvtColor(this_blur_delta, cv2.COLOR_BGR2GRAY)
-        # masked = mask_frame(mask, prior_frame)
-        # show_frame(masked)
-
-        return mask
+        return blurred_mask
 
 
 def present_masks(source: FrameSource, conversion=cv2.COLOR_BGR2GRAY, *args, **kwargs):
