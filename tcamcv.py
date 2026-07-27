@@ -362,6 +362,7 @@ class Overlayer:
         overlaid = frame_to_mask.astype(np.float16) * (
             overlay if len(frame_to_mask.shape) == 2 else overlay[:, :, np.newaxis]
         )
+        # FIXME: clip?
         return overlaid.astype(np.uint8)
 
     def threshold(self, frame: Frame, mask_threshold: int = 128):
