@@ -7,13 +7,16 @@ import cv2
 from cv2 import VideoCapture
 import numpy as np
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Optional
+from typing import Any, Callable, Iterable, Iterator, Optional, Protocol
 
 # A video frame.
 Frame = np.ndarray
 
 # A (presumed) source of video frames.
 FrameSource = VideoCapture | Iterable[Frame] | Path | str
+
+# NOTE: If the module is reloaded, cv2.destroyAllWindows is needed before
+# showing new frames.
 
 
 class Playlist:
@@ -72,6 +75,7 @@ grays = iter_gray_frames
 class Differencer:
     def __init__(self, prior_frame: Optional[Frame] = None):
         self._prior_frame = prior_frame
+        self.send = self.feed  # Imitate primed generator.
 
     def feed(self, frame: Frame) -> Frame | None:
         """Send priming or running inputs."""
@@ -119,7 +123,7 @@ def present_with(
     source: FrameSource,
     func: Callable[[FrameSource], Iterator[Frame]],
     wait: Optional[int] = None,
-    **kwargs
+    **kwargs,
 ):
     wait = 1 if wait is None else wait
     for frame in func(source, **kwargs):
@@ -136,6 +140,10 @@ def present_diffs(source: FrameSource, wait: Optional[int] = None):
 
 def blend(a, b, alpha: float):
     return cv2.addWeighted(a, alpha, b, 1 - alpha, 0)
+
+
+def blend2(b: Frame, a: Frame, alpha: float):
+    return blend(a, b, alpha)
 
 
 def mask_frame(mask, frame):
@@ -220,6 +228,48 @@ class FrameHistory:
                 return self.history[0]
 
 
+class ExtendedReducer[S, U, R](Protocol):
+    # The / prevents keyword access with these names, avoiding type-checking
+    # issues on the names and keyword argument mismatch.
+    def __call__(self, a: S, b: U, /, *args: Any, **kwargs: Any) -> R: ...
+
+
+# Types: initial state, update value, normal state.
+class IntegratorBase[I, U, S]:
+    def __init__(
+        self, reducer: ExtendedReducer[I | S, U, S], initial_state: I, *args, **kwargs
+    ):
+        self.reducer = reducer
+        self.prior_state: I | S = initial_state
+        self.args = args
+        self.kwargs = kwargs
+
+    def next(self, change: U):
+        new_state = self.reducer(self.prior_state, change, *self.args, **self.kwargs)
+        self.prior_state = new_state
+        return new_state
+
+
+class Integrator[S, U](IntegratorBase[S, U, S]):
+    def __init__(
+        self, reducer: ExtendedReducer[S, U, S], initial_state: S, *args, **kwargs
+    ):
+        super().__init__(reducer, initial_state, args, kwargs)
+
+
+class BlankItegrator[S](IntegratorBase[None, S, S]):
+    """Integrator designed to wait for its first state."""
+
+    def __init__(self, reducer: ExtendedReducer[S, S, S], *args, **kwargs):
+        def wrapped_reducer(state: S | None, update: S, *args, **kwargs) -> S:
+            if state is None:
+                return update
+            else:
+                return reducer(state, update, *args, **kwargs)
+
+        super().__init__(wrapped_reducer, None, *args, **kwargs)
+
+
 class MaskGenerator:
     def __init__(
         self,
@@ -251,10 +301,9 @@ class MaskGenerator:
 
         self.differ = Differencer(first_frame)
 
-        self.prior_blend = None
-
-        self.blended_blur = None
-        self.blended_mask = None
+        self.diff_blender = BlankItegrator[Frame](blend, alpha)
+        self.blur_blender = BlankItegrator[Frame](blend, beta)
+        self.mask_blender = BlankItegrator[Frame](blend, mask_blend_factor)
 
     def _get_fine_blur(self, frame: Frame):
         return blur(frame, self.innerblur)
@@ -264,16 +313,7 @@ class MaskGenerator:
 
     def next(self, frame: Frame) -> Frame:
         this_diff = self.differ.next(frame)
-
-        # TODO: Use generators that can be sent the shared frame and return
-        # their respective next output.
-
-        if self.prior_blend is None:
-            this_blend = this_diff
-        else:
-            this_blend = blend(this_diff, self.prior_blend, self.alpha)
-
-        self.prior_blend = this_blend
+        this_blend = self.diff_blender.next(this_diff)
 
         fine_blur = self._get_fine_blur(this_blend)
         # Would it be more efficient to apply additional blur to fine_blur?
@@ -293,14 +333,7 @@ class MaskGenerator:
         # show_frame(np.where(this_blur_delta < 0, 128, this_blur_delta))
         # this_blur_delta = this_blur_delta.astype(np.uint8)
 
-        blended_blur = self.blended_blur
-
-        if blended_blur is None:
-            blended_blur = this_blur_delta
-        else:
-            blended_blur = blend(blended_blur, this_blur_delta, self.beta)
-
-        self.blended_blur = blended_blur
+        blended_blur = self.blur_blender.next(this_blur_delta)
 
         # Create mask with full-scale values where the image should have a mask
         # (blocked out or diminished).
@@ -309,15 +342,7 @@ class MaskGenerator:
             blended_blur, self.threshold, 255, cv2.THRESH_BINARY
         )  # cv2.THRESH_BINARY_INV)
 
-        blended_mask = self.blended_mask
-
-        if blended_mask is None:
-            blended_mask = mask
-        else:
-            blended_mask = blend(mask, blended_mask, self.mask_blend_factor)
-
-        self.blended_mask = blended_mask
-
+        blended_mask = self.mask_blender.next(mask)
         blurred_mask = blur(blended_mask, self.mask_blur_radius)
         # show_frame(blurred_mask)
 
@@ -328,6 +353,17 @@ class MaskGenerator:
         # show_frame(masked)
 
         return mask
+
+
+def present_masks(source: FrameSource, conversion=cv2.COLOR_BGR2GRAY, *args, **kwargs):
+    frames = iter_gray_frames(source, conversion)
+    first_frame = next(frames)
+
+    mask_generator = MaskGenerator(first_frame, *args, **kwargs)
+
+    for frame in frames:
+        mask = mask_generator.next(frame)
+        show_frame(mask)
 
 
 class Overlayer:
@@ -385,7 +421,7 @@ def present_masked_frames(
     delay: int | None = None,
     conversion=cv2.COLOR_BGR2GRAY,
     *args,
-    **kwargs
+    **kwargs,
 ):
     frames = iterframes(source)
     first_frame = next(frames)
@@ -397,7 +433,7 @@ def present_masked_frames(
             else cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
         ),
         *args,
-        **kwargs
+        **kwargs,
     )
 
     def mask_func(frame: Frame):
